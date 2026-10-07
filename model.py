@@ -26,54 +26,81 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+class RMSNorm(nn.Module):
+    def __init__(self, ndim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(ndim))
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+def make_norm(config):
+    if config.norm_type == 'rmsnorm':
+        return RMSNorm(config.n_embd)
+    return LayerNorm(config.n_embd, bias=config.bias)
+
+def apply_rope(x, cos, sin):
+    # x: (B, n_head, T, head_size)，把相邻两维 (2t, 2t+1) 当作一个二维向量旋转
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    out = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
+    return out.type_as(x)
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head if config.n_kv_head > 0 else config.n_head
+        assert self.n_head % self.n_kv_head == 0
+        self.n_embd = config.n_embd
+        self.hs = config.n_embd // config.n_head
+        self.dropout = config.dropout
+        self.pos_type = config.pos_type
+        # q 有 n_head 个头，k 和 v 各有 n_kv_head 个头
+        self.c_attn = nn.Linear(config.n_embd, (self.n_head + 2 * self.n_kv_head) * self.hs, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        if self.pos_type == 'rope':
+            inv_freq = 1.0 / (10000 ** (torch.arange(0, self.hs, 2).float() / self.hs))
+            freqs = torch.outer(torch.arange(config.block_size).float(), inv_freq)  # (T, hs/2)
+            self.register_buffer('rope_cos', freqs.cos(), persistent=False)
+            self.register_buffer('rope_sin', freqs.sin(), persistent=False)
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
+        hs = self.hs
+        q, k, v = self.c_attn(x).split([self.n_head * hs, self.n_kv_head * hs, self.n_kv_head * hs], dim=2)
+        q = q.view(B, T, self.n_head, hs).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_head, hs).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_head, hs).transpose(1, 2)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        if self.pos_type == 'rope':
+            cos, sin = self.rope_cos[:T], self.rope_sin[:T]
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.n_kv_head != self.n_head:   # GQA：每 rep 个 q head 共享同一组 k/v
+            rep = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+            y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_dropout(self.c_proj(y))
 
 class MLP(nn.Module):
 
@@ -91,14 +118,25 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class SwiGLUMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        h = int(8 * config.n_embd / 3)
+        self.w1 = nn.Linear(config.n_embd, h, bias=config.bias)
+        self.w3 = nn.Linear(config.n_embd, h, bias=config.bias)
+        self.c_proj = nn.Linear(h, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+    def forward(self, x):
+        return self.dropout(self.c_proj(F.silu(self.w1(x)) * self.w3(x)))
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = make_norm(config)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ln_2 = make_norm(config)
+        self.mlp = SwiGLUMLP(config) if config.mlp_type == 'swiglu' else MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -113,7 +151,11 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = True
+    norm_type: str = 'layernorm'
+    mlp_type: str = 'gelu'
+    pos_type: str = 'learned'
+    n_kv_head: int = 0
 
 class GPT(nn.Module):
 
@@ -128,7 +170,7 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = make_norm(config),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -175,8 +217,11 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.pos_type == 'learned':
+            x = tok_emb + self.transformer.wpe(pos)
+        else:
+            x = tok_emb          # NoPE 和 RoPE 都不加绝对位置编码
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
